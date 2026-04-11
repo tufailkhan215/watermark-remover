@@ -283,7 +283,22 @@ class Api:
         })
 
         # Build command
-        cmd = [sys.executable, 'remwm.py', input_path, output_path]
+        python_exe = sys.executable
+        venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'venv', 'Scripts', 'python.exe')
+        if os.path.exists(venv_python):
+            python_exe = venv_python
+        
+        # For Windows, we need to activate the venv first
+        if sys.platform == 'win32' and os.path.exists(venv_python):
+            venv_dir = os.path.dirname(os.path.dirname(venv_python))
+            activate_script = os.path.join(venv_dir, 'Scripts', 'activate.bat')
+            cmd = [
+                'cmd', '/c',
+                f'call "{activate_script}" && "{python_exe}" remwm.py',
+                input_path, output_path
+            ]
+        else:
+            cmd = [python_exe, 'remwm.py', input_path, output_path]
 
         if settings.get('overwrite'):
             cmd.append('--overwrite')
@@ -430,20 +445,39 @@ class Api:
             return {'error': 'No input path specified'}
 
         try:
-            # Call CLI with --preview flag
-            cmd = [
-                sys.executable, 'remwm.py',
-                input_path, '--preview',
-                '--max-bbox-percent', str(int(max_bbox)),
-                '--detection-prompt', detection_prompt
-            ]
+            # Use virtual environment Python if available
+            python_exe = sys.executable
+            venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'venv', 'Scripts', 'python.exe')
+            if os.path.exists(venv_python):
+                python_exe = venv_python
+            
+            # For Windows, we need to activate the venv first
+            if sys.platform == 'win32' and os.path.exists(venv_python):
+                venv_dir = os.path.dirname(os.path.dirname(venv_python))
+                activate_script = os.path.join(venv_dir, 'Scripts', 'activate.bat')
+                cmd = [
+                    'cmd', '/c',
+                    f'call "{activate_script}" && "{python_exe}" remwm.py',
+                    input_path, '--preview',
+                    '--max-bbox-percent', str(int(max_bbox)),
+                    '--detection-prompt', detection_prompt
+                ]
+            else:
+                # Call CLI with --preview flag
+                cmd = [
+                    python_exe, 'remwm.py',
+                    input_path, '--preview',
+                    '--max-bbox-percent', str(int(max_bbox)),
+                    '--detection-prompt', detection_prompt
+                ]
 
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=120,
-                cwd=os.path.dirname(os.path.abspath(__file__))
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                env=os.environ.copy()
             )
 
             if result.returncode != 0:

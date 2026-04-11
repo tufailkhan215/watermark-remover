@@ -6,15 +6,13 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 # Monkey-patch: cached_download was removed in huggingface_hub 0.24, add compatibility shim
-import huggingface_hub
-if not hasattr(huggingface_hub, 'cached_download'):
-    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, 'cached_download'):
+        huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+except ImportError:
+    pass  # huggingface_hub not available, skip monkey-patch
 
-from transformers import AutoProcessor, Florence2ForConditionalGeneration
-from iopaint.model_manager import ModelManager
-from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
-import torch
-from torch.nn import Module
 import tqdm
 from loguru import logger
 from enum import Enum
@@ -52,7 +50,11 @@ def download_lama_model():
 def load_lama_model(device):
     """Load LaMA model, downloading if necessary."""
     try:
+        from iopaint.model_manager import ModelManager
         return ModelManager(name="lama", device=device)
+    except ImportError:
+        logger.warning("iopaint is not installed. OpenCV inpainting fallback will be used.")
+        return None
     except NotImplementedError as e:
         if "Unsupported model: lama" in str(e):
             print("LaMA model not available, attempting to download...")
@@ -62,6 +64,7 @@ def load_lama_model(device):
                 import iopaint.model
                 importlib.reload(iopaint.model)
                 # Try again
+                from iopaint.model_manager import ModelManager
                 return ModelManager(name="lama", device=device)
             else:
                 raise RuntimeError("Failed to download LaMA model. Please run manually: python\\python.exe -m iopaint download --model lama")
@@ -71,7 +74,7 @@ class TaskType(str, Enum):
     OPEN_VOCAB_DETECTION = "<OPEN_VOCABULARY_DETECTION>"
     """Detect bounding box for objects and OCR text"""
 
-def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str):
+def identify(task_prompt: TaskType, image: MatLike, text_input: str, model, processor, device: str):
     if not isinstance(task_prompt, TaskType):
         raise ValueError(f"task_prompt must be a TaskType, but {task_prompt} is of type {type(task_prompt)}")
 
@@ -94,7 +97,148 @@ def identify(task_prompt: TaskType, image: MatLike, text_input: str, model: Flor
         generated_text, task=task_prompt.value, image_size=(image.width, image.height)
     )
 
-def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
+def scale_mask_to_image(reference_mask: Image.Image, target_size: tuple) -> Image.Image:
+    """
+    Scale a reference mask proportionally to match a target image size.
+    Preserves the relative position of the watermark region.
+    The mask is assumed to use black (0) for watermark pixels, white (255) for background.
+    Returns a binary mask in L mode with watermark pixels as 255.
+    """
+    src_w, src_h = reference_mask.size
+    tgt_w, tgt_h = target_size
+
+    arr = np.array(reference_mask.convert("L"))
+    # Invert: black (watermark) -> 255, white (background) -> 0
+    watermark_arr = np.where(arr < 128, 255, 0).astype(np.uint8)
+
+    # Find bounding box of watermark region in source mask
+    ys, xs = np.where(watermark_arr == 255)
+    if len(xs) == 0:
+        return None
+
+    # Scale bounding box proportionally to target image dimensions
+    scale_x = tgt_w / src_w
+    scale_y = tgt_h / src_h
+
+    x1 = int(xs.min() * scale_x)
+    x2 = int(xs.max() * scale_x)
+    y1 = int(ys.min() * scale_y)
+    y2 = int(ys.max() * scale_y)
+
+    # Build scaled mask: white canvas, fill watermark bbox with 255
+    scaled = np.zeros((tgt_h, tgt_w), dtype=np.uint8)
+    scaled[y1:y2+1, x1:x2+1] = 255
+    logger.info(f"Scaled reference mask: source {src_w}x{src_h} -> target {tgt_w}x{tgt_h}, "
+                f"watermark bbox ({x1},{y1})-({x2},{y2})")
+    return Image.fromarray(scaled)
+
+
+def match_reference_mask_to_image(image: Image.Image, reference_mask: Image.Image, min_confidence: float = 0.25):
+    """
+    Try to place the watermark reference mask onto the current image.
+
+    Strategy 1: proportional scale — fast, works when watermark is at a fixed
+    relative position across all images (same source site/template).
+    Strategy 2: edge-based template matching — slower, handles minor positional drift.
+    """
+    target = np.array(image.convert("L"))
+    arr = np.array(reference_mask.convert("L"))
+
+    # Invert: black (watermark) -> 255, white (background) -> 0
+    watermark_arr = np.where(arr < 128, 255, 0).astype(np.uint8)
+    if watermark_arr.sum() == 0:
+        return None
+
+    src_w, src_h = reference_mask.size
+    tgt_w, tgt_h = image.size
+
+    # --- Strategy 1: proportional scale (preferred) ---
+    scaled_mask = scale_mask_to_image(reference_mask, (tgt_w, tgt_h))
+    if scaled_mask is not None:
+        logger.info("Using proportional-scaled reference mask")
+        return scaled_mask
+
+    # --- Strategy 2: edge template matching (fallback) ---
+    # Scale the watermark patch to match source/target ratio before matching
+    scale_x = tgt_w / src_w
+    scale_y = tgt_h / src_h
+    scaled_w = int(watermark_arr.shape[1] * scale_x)
+    scaled_h = int(watermark_arr.shape[0] * scale_y)
+    scaled_template = cv2.resize(watermark_arr, (scaled_w, scaled_h), interpolation=cv2.INTER_NEAREST)
+
+    template_edges = cv2.Canny(scaled_template, 50, 150)
+    target_edges = cv2.Canny(target, 50, 150)
+
+    if template_edges.sum() == 0 or target_edges.sum() == 0:
+        return None
+
+    if target_edges.shape[0] < template_edges.shape[0] or target_edges.shape[1] < template_edges.shape[1]:
+        return None
+
+    res = cv2.matchTemplate(target_edges, template_edges, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+    if max_val < min_confidence:
+        logger.warning(f"Reference watermark template match too weak: {max_val:.2f}")
+        return None
+
+    x, y = max_loc
+    h, w = scaled_template.shape
+    mask = np.zeros(target.shape, dtype=np.uint8)
+    mask[y:y+h, x:x+w] = scaled_template
+    logger.info(f"Template match accepted: confidence={max_val:.2f}, loc=({x},{y})")
+    return Image.fromarray(mask)
+
+
+def load_reference_mask(image_path: Path, masks_dir: Path = None, watermarked_dir: Path = None):
+    """
+    Load a reference mask for the given image if available.
+    Looks for mask0.png/jpg or image-specific masks in masks_dir.
+
+    Args:
+        image_path: Path to the input image
+        masks_dir: Directory containing mask files (e.g., mask0.jpg or mask0.png)
+        watermarked_dir: Directory containing watermarked reference images
+
+    Returns:
+        PIL Image mask (L mode) or None if no reference found
+    """
+    if masks_dir and masks_dir.exists():
+        # Try image-specific mask first (e.g., 001.jpg -> 001_mask.jpg)
+        mask_path = masks_dir / f"{image_path.stem}_mask{image_path.suffix}"
+        if mask_path.exists():
+            logger.info(f"Using image-specific mask: {mask_path}")
+            return Image.open(mask_path).convert("L")
+
+        # Try generic mask0.png, then mask0.jpg
+        for mask_name in ["mask0.png", "mask0.jpg"]:
+            mask0_path = masks_dir / mask_name
+            if mask0_path.exists():
+                logger.info(f"Using reference mask: {mask0_path}")
+                return Image.open(mask0_path).convert("L")
+
+    # If there is a reference watermarked example, keep the mask reference available
+    if watermarked_dir and watermarked_dir.exists():
+        watermarked_path = watermarked_dir / "watermarked0.jpg"
+        if watermarked_path.exists():
+            logger.info(f"Reference watermarked example available: {watermarked_path}")
+
+    return None
+
+
+def dilate_mask(mask: Image.Image, pixels: int = 8) -> Image.Image:
+    """
+    Expand the inpaint mask by `pixels` in every direction.
+    Dilation ensures LaMA sees enough context at the watermark boundary
+    to blend seamlessly into the surrounding texture.
+    """
+    arr = np.array(mask.convert("L"))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (pixels * 2 + 1, pixels * 2 + 1))
+    dilated = cv2.dilate(arr, kernel, iterations=1)
+    return Image.fromarray(dilated)
+
+
+def get_watermark_mask(image: MatLike, model, processor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark", reference_mask: Image.Image = None):
     """
     Detect watermarks and create a mask for inpainting.
 
@@ -105,7 +249,29 @@ def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration,
         device: cuda or cpu
         max_bbox_percent: Maximum bbox size as percentage of image
         detection_prompt: Text prompt for detection (e.g. "watermark", "watermark Sora logo", "Getty Images")
+        reference_mask: Optional reference mask image to use instead of AI detection
     """
+    # If we have a reference mask, place it into the current image via template matching
+    if reference_mask is not None:
+        if reference_mask.mode != "L":
+            reference_mask = reference_mask.convert("L")
+        if reference_mask.size == image.size:
+            # mask0.png stores watermark as black (0), background as white (255).
+            # LaMA/iopaint expects white (255) = area to inpaint.
+            # Invert so watermark pixels become 255.
+            arr = np.array(reference_mask)
+            inverted = Image.fromarray(np.where(arr < 128, 255, 0).astype(np.uint8))
+            logger.info("Using reference mask (inverted) for watermark detection")
+            return dilate_mask(inverted)
+
+        matched = match_reference_mask_to_image(image, reference_mask)
+        if matched is not None:
+            logger.info("Using matched reference mask for watermark detection")
+            return dilate_mask(matched)
+
+        logger.warning("Reference mask size differs and template matching did not find a good placement; falling back to AI detection.")
+
+    # Fall back to AI detection
     task_prompt = TaskType.OPEN_VOCAB_DETECTION
     parsed_answer = identify(task_prompt, image, detection_prompt, model, processor, device)
 
@@ -126,7 +292,7 @@ def get_watermark_mask(image: MatLike, model: Florence2ForConditionalGeneration,
     return mask
 
 
-def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, processor: AutoProcessor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
+def detect_only(image: MatLike, model, processor, device: str, max_bbox_percent: float, detection_prompt: str = "watermark"):
     """
     Detect watermarks and return bounding boxes WITHOUT creating mask or inpainting.
     Used for preview mode to show what would be detected.
@@ -156,7 +322,8 @@ def detect_only(image: MatLike, model: Florence2ForConditionalGeneration, proces
 
     return results
 
-def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelManager):
+def process_image_with_lama(image: MatLike, mask: MatLike, model_manager):
+    from iopaint.schema import HDStrategy, LDMSampler, InpaintRequest as Config
     config = Config(
         ldm_steps=50,
         ldm_sampler=LDMSampler.ddim,
@@ -171,6 +338,27 @@ def process_image_with_lama(image: MatLike, mask: MatLike, model_manager: ModelM
         result = np.clip(result, 0, 255).astype(np.uint8)
 
     return result
+
+
+def process_image_with_opencv_inpaint(image: MatLike, mask: MatLike):
+    """Fallback inpainting using OpenCV if LaMA is unavailable."""
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    if mask.dtype != np.uint8:
+        mask = mask.astype(np.uint8)
+    mask = np.where(mask > 0, 255, 0).astype(np.uint8)
+
+    # OpenCV requires a single-channel mask with non-zero pixels as the inpainting area.
+    result = cv2.inpaint(image, mask, 3, cv2.INPAINT_TELEA)
+    return result
+
+
+def inpaint_image(image: MatLike, mask: MatLike, model_manager):
+    if model_manager is not None:
+        return process_image_with_lama(image, mask, model_manager)
+    logger.warning("LaMA unavailable: using OpenCV inpainting fallback.")
+    return process_image_with_opencv_inpaint(image, mask)
+
 
 def make_region_transparent(image: Image.Image, mask: Image.Image):
     image = image.convert("RGBA")
@@ -253,9 +441,8 @@ def process_video(input_path, output_path, florence_model, florence_processor, m
                 background.paste(result_image, mask=result_image.split()[3])
                 result_image = background
             else:
-                lama_result = process_image_with_lama(np.array(pil_image), np.array(mask_image), model_manager)
-                result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
-            
+                    inpainted = inpaint_image(np.array(pil_image), np.array(mask_image), model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
             # Convert back to OpenCV format and write to output video
             frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             out.write(frame_result)
@@ -448,8 +635,8 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
                     background.paste(result_image, mask=result_image.split()[3])
                     result_image = background
                 else:
-                    lama_result = process_image_with_lama(np.array(pil_image), np.array(mask), model_manager)
-                    result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+                    inpainted = inpaint_image(np.array(pil_image), np.array(mask), model_manager)
+                    result_image = Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
 
                 frame_result = cv2.cvtColor(np.array(result_image), cv2.COLOR_RGB2BGR)
             else:
@@ -503,7 +690,7 @@ def process_video_two_pass(input_path, output_path, florence_model, florence_pro
     return output_file
 
 
-def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt="watermark", detection_skip=1, fade_in=0.0, fade_out=0.0, progress_offset=0, progress_scale=100):
+def handle_one(image_path: Path, output_path: Path, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt="watermark", detection_skip=1, fade_in=0.0, fade_out=0.0, progress_offset=0, progress_scale=100, masks_dir=None, watermarked_dir=None):
     # SAFETY: Never overwrite the input file
     if image_path.resolve() == output_path.resolve():
         logger.error(f"Cannot overwrite input file: {image_path}. Choose a different output path.")
@@ -525,24 +712,32 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
 
     # Process image
     image = Image.open(image_path).convert("RGB")
-    mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt)
+
+    # Try to load reference mask
+    reference_mask = load_reference_mask(image_path, masks_dir, watermarked_dir)
+
+    mask_image = get_watermark_mask(image, florence_model, florence_processor, device, max_bbox_percent, detection_prompt, reference_mask)
 
     if transparent:
         result_image = make_region_transparent(image, mask_image)
     else:
-        lama_result = process_image_with_lama(np.array(image), np.array(mask_image), model_manager)
-        result_image = Image.fromarray(cv2.cvtColor(lama_result, cv2.COLOR_BGR2RGB))
+        inpainted = inpaint_image(np.array(image), np.array(mask_image), model_manager)
+        result_image = Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
 
     # Determine output format
     if force_format:
         output_format = force_format.upper()
     elif transparent:
         output_format = "PNG"
+    elif output_path.suffix:
+        output_format = output_path.suffix[1:].upper()
+        if output_format not in ["PNG", "WEBP", "JPG"]:
+            output_format = "PNG"
     else:
         output_format = image_path.suffix[1:].upper()
         if output_format not in ["PNG", "WEBP", "JPG"]:
             output_format = "PNG"
-    
+
     # Map JPG to JPEG for PIL compatibility
     if output_format == "JPG":
         output_format = "JPEG"
@@ -551,8 +746,19 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
         logger.warning("Transparency detected. Defaulting to PNG for transparency support.")
         output_format = "PNG"
 
-    new_output_path = output_path.with_suffix(f".{output_format.lower()}")
-    result_image.save(new_output_path, format=output_format)
+    if output_path.is_dir() or output_path.suffix == "":
+        new_output_path = output_path.with_suffix(f".{output_format.lower()}")
+    else:
+        new_output_path = output_path
+
+    new_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result_image.save(new_output_path, format=output_format)
+    except OSError as e:
+        logger.error(f"Failed to save output image '{new_output_path}': {e}")
+        raise
+
     # Report progress for this image (end of range)
     final_progress = progress_offset + progress_scale
     print(f"input_path:{image_path}, output_path:{new_output_path}, overall_progress:{final_progress}%")
@@ -570,7 +776,10 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
 @click.option("--detection-skip", default=1, type=int, help="Detect watermarks every N frames for videos (1-10). Higher = faster but may miss brief watermarks.")
 @click.option("--fade-in", default=0.0, type=float, help="Extend mask backwards by N seconds to handle fade-in watermarks.")
 @click.option("--fade-out", default=0.0, type=float, help="Extend mask forwards by N seconds to handle fade-out watermarks.")
-def main(input_path: str, output_path: str, preview: bool, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, detection_prompt: str, detection_skip: int, fade_in: float, fade_out: float):
+@click.option("--masks-dir", type=click.Path(exists=True), default=None, help="Directory containing reference mask images (e.g., mask0.jpg).")
+@click.option("--watermarked-dir", type=click.Path(exists=True), default=None, help="Directory containing watermarked reference images for template matching.")
+@click.option("--opencv-fallback", is_flag=True, default=False, help="Allow OpenCV inpainting fallback when LaMA/iopaint is unavailable.")
+def main(input_path: str, output_path: str, preview: bool, overwrite: bool, transparent: bool, max_bbox_percent: float, force_format: str, detection_prompt: str, detection_skip: int, fade_in: float, fade_out: float, masks_dir: str, watermarked_dir: str, opencv_fallback: bool):
     # Input validation
     if detection_skip < 1 or detection_skip > 10:
         logger.warning(f"detection_skip must be 1-10, got {detection_skip}. Using 1.")
@@ -582,12 +791,18 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
 
     input_path = Path(input_path)
 
+    # Convert reference directories to Path objects
+    masks_dir = Path(masks_dir) if masks_dir else None
+    watermarked_dir = Path(watermarked_dir) if watermarked_dir else None
+
     # ========== PREVIEW MODE ==========
     if preview:
         import json
         import base64
         from io import BytesIO
         import random
+        import torch
+        from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -665,6 +880,8 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
 
     # ========== NORMAL PROCESSING MODE ==========
     output_path = Path(output_path)
+    import torch
+    from transformers import AutoProcessor, Florence2ForConditionalGeneration
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -681,7 +898,10 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
 
     if not transparent:
         model_manager = load_lama_model(device)
-        logger.info("LaMa model loaded")
+        if model_manager is not None:
+            logger.info("LaMa model loaded")
+        else:
+            logger.warning("LaMa model unavailable. Falling back to OpenCV inpainting.")
     else:
         model_manager = None
 
@@ -700,7 +920,26 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             # Calculate progress range for this file
             progress_offset = int(idx / total_files * 100)
             progress_scale = int(100 / total_files)
-            handle_one(file_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, progress_offset, progress_scale)
+            handle_one(
+                file_path,
+                output_file,
+                florence_model,
+                florence_processor,
+                model_manager,
+                device,
+                transparent,
+                max_bbox_percent,
+                force_format,
+                overwrite,
+                detection_prompt,
+                detection_skip,
+                fade_in,
+                fade_out,
+                progress_offset,
+                progress_scale,
+                masks_dir=masks_dir,
+                watermarked_dir=watermarked_dir,
+            )
     else:
         # Single file mode - if output is a directory, construct file path
         if output_path.is_dir():
@@ -715,7 +954,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             else:
                 output_file = output_file.with_suffix(".mp4")  # Default to mp4
 
-        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out)
+        handle_one(input_path, output_file, florence_model, florence_processor, model_manager, device, transparent, max_bbox_percent, force_format, overwrite, detection_prompt, detection_skip, fade_in, fade_out, masks_dir=masks_dir, watermarked_dir=watermarked_dir)
         print(f"input_path:{input_path}, output_path:{output_file}, overall_progress:100")
 
 if __name__ == "__main__":
