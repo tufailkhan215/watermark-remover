@@ -1,0 +1,30 @@
+# Python virtual environment
+WatermarkRemover-AI/venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Processed output images (large, generated)
+images_clean/
+
+# Input images (large, source data)
+images/
+
+
+# Temporary debug/test files
+WatermarkRemover-AI/debug_detect/
+WatermarkRemover-AI/tmp_*.py
+WatermarkRemover-AI/__pycache__/
+
+# Model cache
+*.pt
+*.bin
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
