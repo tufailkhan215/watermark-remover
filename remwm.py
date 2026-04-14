@@ -754,7 +754,10 @@ def handle_one(image_path: Path, output_path: Path, florence_model, florence_pro
     new_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        result_image.save(new_output_path, format=output_format)
+        save_kwargs = {}
+        if output_format == "WEBP":
+            save_kwargs["quality"] = 90
+        result_image.save(new_output_path, format=output_format, **save_kwargs)
     except OSError as e:
         logger.error(f"Failed to save output image '{new_output_path}': {e}")
         raise
@@ -818,7 +821,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
         # Get sample image from input
         if input_path.is_dir():
             # Get a random image from directory
-            images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
+            images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.jpeg")) + list(input_path.glob("*.webp"))
             videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov"))
             files = images + videos
             if not files:
@@ -910,7 +913,7 @@ def main(input_path: str, output_path: str, preview: bool, overwrite: bool, tran
             output_path.mkdir(parents=True)
 
         # Include video files in the search
-        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.webp"))
+        images = list(input_path.glob("*.[jp][pn]g")) + list(input_path.glob("*.jpeg")) + list(input_path.glob("*.webp"))
         videos = list(input_path.glob("*.mp4")) + list(input_path.glob("*.avi")) + list(input_path.glob("*.mov")) + list(input_path.glob("*.mkv"))
         files = images + videos
         total_files = len(files)
